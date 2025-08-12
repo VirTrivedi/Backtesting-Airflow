@@ -95,12 +95,20 @@ def process_pcap_file(**context):
         
         if result.returncode != 0:
             raise Exception(f"PcapToRef execution failed: {result.stderr}")
-                
+        
+        # Collect all output files created
+        output_files = []
+        for root, dirs, files in os.walk(output_dir):
+            for file in files:
+                if file.endswith('.bin'):
+                    output_files.append(os.path.join(root, file))
+
         # Return output info for next task
         return {
             'output_dir': output_dir,
             'venue': parsed_params['venue'],
-            'dateint': parsed_params['dateint']
+            'dateint': parsed_params['dateint'],
+            'output_files': output_files
         }
         
     except Exception as e:
@@ -116,18 +124,11 @@ def process_histbook(**context):
         # Create books subdirectory
         books_output_dir = os.path.join(input_dir, 'books/')
         os.makedirs(books_output_dir, exist_ok=True)
-                
-        # Find all book_events files
-        book_event_files = []
-        for root, dirs, files in os.walk(input_dir):
-            if 'books' not in root:
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    if 'book_events' in file and file.endswith('.bin'):
-                        book_event_files.append(file_path)
-                
+        
+        # Get all book event files
+        book_event_files = pcap_info['output_files']
         if not book_event_files:
-            raise Exception(f"No book_events files found in PcapToRef output directory: {input_dir}")
+            raise Exception(f"No book event files found in {input_dir}. Expected .bin files.")
         
         # Process each file individually with HistBook
         successful_files = 0
