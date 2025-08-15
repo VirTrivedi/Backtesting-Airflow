@@ -1,12 +1,66 @@
 from datetime import datetime, timedelta
 from airflow import DAG
-from airflow.operators.python import PythonOperator
 from airflow.operators.bash import BashOperator
+from airflow.decorators import task
 import boto3
 import os
 import subprocess
 import re
 from pathlib import Path
+
+def cleanup_on_failure(context):
+    """Clean up local files if processing fails"""
+    try:
+        # Clean up input file
+        file_info = context['task_instance'].xcom_pull(task_ids='download_pcap_from_s3')
+        input_file = file_info.get('input_file') if file_info else None
+        
+        files_to_clean = []
+        if input_file:
+            files_to_clean.append(input_file)
+
+        # Clean up any dateint/venue directories that might exist
+        if os.path.exists('/tmp'):
+            for item in os.listdir('/tmp'):
+                item_path = os.path.join('/tmp', item)
+                if os.path.isdir(item_path) and item.isdigit() and len(item) == 8:
+                    files_to_clean.append(item_path)
+                elif item.endswith('.pcap.zst') or item.endswith('.pcap'):
+                    files_to_clean.append(item_path)
+
+        # Clean up all identified files/directories
+        for file_path in files_to_clean:
+            if file_path and os.path.exists(file_path):
+                try:
+                    if os.path.isdir(file_path):
+                        import shutil
+                        shutil.rmtree(file_path)
+                    else:
+                        os.remove(file_path)
+                except Exception as cleanup_error:
+                    raise Exception(f"Failed to clean up {file_path}: {cleanup_error}")
+                    
+    except Exception as e:
+        raise Exception(f"Cleanup on failure failed: {e}")
+
+# DAG definition
+default_args = {
+    'owner': 'admin',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 1, 1),
+    'retries': 1,
+    'retry_delay': timedelta(seconds=10),
+    'on_failure_callback': cleanup_on_failure,
+}
+
+dag = DAG(
+    'backtesting_pipeline',
+    default_args=default_args,
+    description='Process PCAP files with PcapToRef, process book_events files with HistBook, and store results in S3',
+    schedule=None,
+    catchup=False,
+    tags=['pcap', 'market-data', 's3']
+)
 
 def parse_pcap_filename(filename):
     """Parse PCAP filename to extract venue, dateint, and colocation"""
@@ -28,6 +82,7 @@ def parse_pcap_filename(filename):
         'colo': colo
     }
 
+@task(dag=dag)
 def download_pcap_from_s3():
     """Download PCAP file from S3 to local processing directory"""
     try:
@@ -55,11 +110,12 @@ def download_pcap_from_s3():
     except Exception as e:
         raise Exception(f"Download failed: {e}")
 
+@task(dag=dag)
 def process_pcap_file(**context):
     """Run PcapToRef on the downloaded PCAP file with parsed parameters"""
     try:        
         # Get file info from previous task
-        file_info = context['task_instance'].xcom_pull(task_ids='download_pcap')
+        file_info = context['task_instance'].xcom_pull(task_ids='download_pcap_from_s3')
         
         if not file_info:
             raise Exception("No file info received from download task")
@@ -114,67 +170,81 @@ def process_pcap_file(**context):
     except Exception as e:
         raise Exception(f"Processing failed: {e}")
             
-def process_histbook(**context):
-    """Run HistBook on each PcapToRef output file individually"""
-    try:
-        # Get info from previous task
-        pcap_info = context['task_instance'].xcom_pull(task_ids='process_pcap')
-        input_dir = pcap_info['output_dir'].rstrip('/')
-        
-        # Create books subdirectory
-        books_output_dir = os.path.join(input_dir, 'books/')
-        os.makedirs(books_output_dir, exist_ok=True)
-        
-        # Get all book event files
-        book_event_files = pcap_info['output_files']
-        if not book_event_files:
-            raise Exception(f"No book event files found in {input_dir}. Expected .bin files.")
-        
-        # Process each file individually with HistBook
-        successful_files = 0
-        failed_files = 0
-        
-        for i, input_file in enumerate(book_event_files, 1):
-            cmd = ['/home/airflow/HistBook', '-i', input_file, '-o', books_output_dir]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=None
-            )
-                        
-            if result.returncode == 0:
-                successful_files += 1
-            else:
-                failed_files += 1
-                
-        # Check what output files were created
-        book_output_files = []
-        for root, dirs, files in os.walk(books_output_dir):
-            for file in files:
-                book_output_files.append(os.path.join(root, file))
-                
-        # Don't fail the task if some files failed
-        if successful_files == 0:
-            raise Exception(f"HistBook failed to process any files. All {failed_files} files failed.")
-        elif failed_files > 0:
-            print(f"Warning: {failed_files} files failed to process, but {successful_files} succeeded.")
-        
-        return {
-            'final_output_dir': input_dir,
-            'venue': pcap_info['venue'],
-            'dateint': pcap_info['dateint'],
+@task(dag=dag)
+def get_histbook_file_list(**context):
+    """Get the list of files to process"""
+    pcap_info = context['task_instance'].xcom_pull(task_ids='process_pcap_file')
+    output_files = pcap_info.get('output_files', [])
+    
+    # Return list of file info dicts
+    return [
+        {
+            'file_path': file_path,
+            'file_name': os.path.basename(file_path),
+            'file_index': i
         }
+        for i, file_path in enumerate(output_files)
+    ]
+
+@task(dag=dag)
+def process_single_book_events_file(file_info: dict, **context):
+    """Process a single book_events file"""
+    file_path = file_info['file_path']
+    file_name = file_info['file_name']
         
-    except Exception as e:
-        raise Exception(f"HistBook processing failed: {e}")
-                
+    # Get additional context
+    pcap_info = context['task_instance'].xcom_pull(task_ids='process_pcap_file')
+    input_dir = pcap_info['output_dir']
+    books_output_dir = os.path.join(input_dir, 'books/')
+    os.makedirs(books_output_dir, exist_ok=True)
+    
+    # Verify input file exists
+    if not os.path.exists(file_path):
+        raise Exception(f"Input file does not exist: {file_path}")
+    
+    # Run HistBook
+    cmd = ['/home/airflow/HistBook', '-i', file_path, '-o', books_output_dir]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=None
+    )
+    
+    success = result.returncode == 0  
+    return {
+        'file_name': file_name,
+        'file_path': file_path,
+        'success': success,
+        'return_code': result.returncode,
+        'error': result.stderr if not success else None
+    }
+
+@task(dag=dag)
+def collect_histbook_results(histbook_results: list, **context):
+    """Collect and summarize all HistBook results"""    
+    successful_files = sum(1 for result in histbook_results if result.get('success', False))
+    failed_files = len(histbook_results) - successful_files
+        
+    # Get context info
+    pcap_info = context['task_instance'].xcom_pull(task_ids='process_pcap_file')
+    
+    return {
+        'final_output_dir': pcap_info['output_dir'],
+        'successful_files': successful_files,
+        'failed_files': failed_files,
+        'total_files': len(histbook_results),
+        'venue': pcap_info['venue'],
+        'dateint': pcap_info['dateint'],
+    }
+
+@task(dag=dag)
 def upload_results_to_s3_sync(**context):
     """Upload output directory using AWS CLI sync"""
     try:
         # Get info from previous tasks
-        file_info = context['task_instance'].xcom_pull(task_ids='download_pcap')
-        histbook_info = context['task_instance'].xcom_pull(task_ids='process_histbook')
+        file_info = context['task_instance'].xcom_pull(task_ids='download_pcap_from_s3')
+        histbook_info = context['task_instance'].xcom_pull(task_ids='collect_histbook_results')
         
         bucket_name = file_info['bucket_name']
         output_dir = histbook_info['final_output_dir']
@@ -183,11 +253,7 @@ def upload_results_to_s3_sync(**context):
         s3_dest = f"s3://{bucket_name}/{histbook_info['dateint']}/{histbook_info['venue']}/"
                 
         # Use AWS CLI sync to upload directory structure
-        sync_cmd = [
-            'aws', 's3', 'sync',
-            output_dir, 
-            s3_dest
-        ]
+        sync_cmd = ['aws', 's3', 'sync', output_dir, s3_dest]
         
         result = subprocess.run(sync_cmd, capture_output=True, text=True)
         
@@ -196,96 +262,43 @@ def upload_results_to_s3_sync(**context):
         
         files_to_clean = []
         
-        # Clean up input PCAP file
+        # Clean up input PCAP file first
         if file_info and file_info.get('input_file'):
             input_file = file_info['input_file']
             if os.path.exists(input_file):
-                files_to_clean.append(input_file)
+                files_to_clean.append(('file', input_file))
         
         # Clean up processing directory
-        if histbook_info and histbook_info.get('final_output_dir'):
-            if os.path.exists(output_dir):
-                files_to_clean.append(output_dir)
+        if os.path.exists(output_dir):
+            dateint_dir = os.path.dirname(output_dir)
+            files_to_clean.append(('directory', dateint_dir))
         
-        # Clean up all files
-        for file_path in files_to_clean:
+        # Clean up all files/directories
+        for item_type, file_path in files_to_clean:
             try:
-                if os.path.isdir(file_path):
+                if item_type == 'directory' and os.path.isdir(file_path):
                     import shutil
                     shutil.rmtree(file_path)
-                else:
+                elif item_type == 'file' and os.path.isfile(file_path):
                     os.remove(file_path)
             except Exception as cleanup_error:
-                raise Exception(f"Failed to clean up {file_path}: {cleanup_error}")
+                print(f"Warning: Failed to clean up {file_path}: {cleanup_error}")
             
         return {
             's3_base_path': s3_dest,
-            'sync_output': result.stdout
+            'sync_output': result.stdout,
+            'histbook_summary': {
+                'total_files': histbook_info['total_files'],
+                'successful_files': histbook_info['successful_files'],
+                'failed_files': histbook_info['failed_files']
+            }
         }
         
     except Exception as e:
         raise Exception(f"Upload failed: {e}")
-
-def cleanup_on_failure(context):
-    """Clean up local files if processing fails"""
-    try:
-        # Clean up input file
-        file_info = context['task_instance'].xcom_pull(task_ids='download_pcap')
-        input_file = file_info.get('input_file') if file_info else None
-        
-        files_to_clean = []
-        if input_file:
-            files_to_clean.append(input_file)
-
-        # Clean up any dateint/venue directories that might exist
-        if os.path.exists('/tmp'):
-            for item in os.listdir('/tmp'):
-                item_path = os.path.join('/tmp', item)
-                if os.path.isdir(item_path) and item.isdigit() and len(item) == 8:
-                    files_to_clean.append(item_path)
-                elif item.endswith('.pcap.zst') or item.endswith('.pcap'):
-                    files_to_clean.append(item_path)
-
-        # Clean up all identified files/directories
-        for file_path in files_to_clean:
-            if file_path and os.path.exists(file_path):
-                try:
-                    if os.path.isdir(file_path):
-                        import shutil
-                        shutil.rmtree(file_path)
-                    else:
-                        os.remove(file_path)
-                except Exception as cleanup_error:
-                    raise Exception(f"Failed to clean up {file_path}: {cleanup_error}")
-                    
-    except Exception as e:
-        raise Exception(f"Cleanup on failure failed: {e}")
-
-# DAG definition
-default_args = {
-    'owner': 'admin',
-    'depends_on_past': False,
-    'start_date': datetime(2025, 1, 1),
-    'retries': 1,
-    'retry_delay': timedelta(seconds=10),
-    'on_failure_callback': cleanup_on_failure,
-}
-
-dag = DAG(
-    'pcap_to_ref_processing',
-    default_args=default_args,
-    description='Process PCAP files with PcapToRef and store results in S3',
-    schedule=None,
-    catchup=False,
-    tags=['pcap', 'market-data', 's3']
-)
-
+    
 # Task definitions
-download_task = PythonOperator(
-    task_id='download_pcap',
-    python_callable=download_pcap_from_s3,
-    dag=dag
-)
+download_task = download_pcap_from_s3()
 
 check_resources_task = BashOperator(
     task_id='check_system_resources',
@@ -304,23 +317,11 @@ check_resources_task = BashOperator(
     dag=dag
 )
 
-process_task = PythonOperator(
-    task_id='process_pcap',
-    python_callable=process_pcap_file,
-    dag=dag
-)
-
-histbook_task = PythonOperator(
-    task_id='process_histbook',
-    python_callable=process_histbook,
-    dag=dag
-)
-
-upload_task = PythonOperator(
-    task_id='upload_results',
-    python_callable=upload_results_to_s3_sync,
-    dag=dag
-)
+process_task = process_pcap_file()
+file_list = get_histbook_file_list()
+histbook_results = process_single_book_events_file.expand(file_info=file_list)
+final_results = collect_histbook_results(histbook_results)
+upload_task = upload_results_to_s3_sync()
 
 # Task dependencies
-download_task >> check_resources_task  >> process_task >> histbook_task >> upload_task
+download_task >> check_resources_task >> process_task >> file_list >> histbook_results >> final_results >> upload_task
