@@ -1,0 +1,307 @@
+---
+- name: Install and Configure Apache Airflow with PostgreSQL
+  hosts: all
+  become: yes
+  vars:
+    airflow_user: airflow
+    airflow_home: /home/airflow/airflow
+    airflow_password: your_secure_password123  # Change this to a secure password
+    postgres_db: airflow_db
+    postgres_user: airflow_user
+    python_version: "3.12"
+    airflow_version: "2.10.3"
+    airflow_admin_user: admin
+    airflow_admin_password: admin123
+
+  tasks:
+    # Steps 1-2: Update system and install packages
+    - name: Update apt cache and upgrade packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - postgresql
+          - postgresql-contrib
+          - libpq-dev
+          - build-essential
+          - python3-dev
+        state: present
+
+    # Step 3: Create airflow user
+    - name: Create airflow user
+      user:
+        name: "{{ airflow_user }}"
+        shell: /bin/bash
+        home: "/home/{{ airflow_user }}"
+        create_home: yes
+        state: present
+
+    # Steps 5-11: Setup Python environment and install Airflow
+    - name: Create Python virtual environment
+      shell: |
+        cd /home/{{ airflow_user }}
+        python3 -m venv airflow-env
+        chown -R {{ airflow_user }}:{{ airflow_user }} airflow-env
+      args:
+        creates: "/home/{{ airflow_user }}/airflow-env"
+
+    - name: Upgrade pip in virtual environment
+      shell: |
+        cd /home/{{ airflow_user }}
+        sudo -u {{ airflow_user }} ./airflow-env/bin/pip install --upgrade pip
+
+    - name: Set AIRFLOW_HOME in .bashrc
+      lineinfile:
+        path: "/home/{{ airflow_user }}/.bashrc"
+        line: "export AIRFLOW_HOME={{ airflow_home }}"
+        create: yes
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    - name: Install Apache Airflow
+      shell: |
+        cd /home/{{ airflow_user }}
+        sudo -u {{ airflow_user }} bash -c 'export AIRFLOW_HOME={{ airflow_home }} && ./airflow-env/bin/pip install "apache-airflow[webserver,postgres]=={{ airflow_version }}" --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-{{ airflow_version }}/constraints-3.12.txt"'
+
+    # Steps 13-23: Configure PostgreSQL
+    - name: Start and enable PostgreSQL service
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Check if Airflow database exists
+      shell: sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw {{ postgres_db }}
+      register: db_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create Airflow database
+      shell: sudo -u postgres createdb {{ postgres_db }}
+      when: db_exists.rc != 0
+
+    - name: Check if Airflow user exists
+      shell: sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ postgres_user }}'"
+      register: user_exists
+      changed_when: false
+
+    - name: Create Airflow database user
+      shell: sudo -u postgres createuser {{ postgres_user }}
+      when: user_exists.stdout != "1"
+
+    - name: Set user password
+      shell: sudo -u postgres psql -c "ALTER USER {{ postgres_user }} PASSWORD '{{ airflow_password }}';"
+
+    - name: Set database owner
+      shell: sudo -u postgres psql -c "ALTER DATABASE {{ postgres_db }} OWNER TO {{ postgres_user }};"
+
+    - name: Grant database privileges
+      shell: sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ postgres_db }} TO {{ postgres_user }};"
+
+    - name: Grant schema privileges
+      shell: sudo -u postgres psql -c "GRANT ALL ON SCHEMA public TO {{ postgres_user }};"
+
+    - name: Grant create privileges on schema
+      shell: sudo -u postgres psql -c "GRANT CREATE ON SCHEMA public TO {{ postgres_user }};"
+
+    - name: Grant schema privileges on airflow_db
+      shell: sudo -u postgres psql {{ postgres_db }} -c "GRANT ALL ON SCHEMA public TO {{ postgres_user }};"
+
+    - name: Set default privileges for tables
+      shell: sudo -u postgres psql {{ postgres_db }} -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO {{ postgres_user }};"
+
+    - name: Set default privileges for sequences
+      shell: sudo -u postgres psql {{ postgres_db }} -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO {{ postgres_user }};"
+
+    # Steps 25-26: Install psycopg2 and prepare Airflow
+    - name: Install psycopg2-binary
+      shell: |
+        cd /home/{{ airflow_user }}
+        sudo -u {{ airflow_user }} ./airflow-env/bin/pip install psycopg2-binary
+
+    - name: Create Airflow home directory
+      file:
+        path: "{{ airflow_home }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    # Step 27: Initialize Airflow database
+    - name: Initialize Airflow database
+      shell: |
+        cd /home/{{ airflow_user }}
+        sudo -u {{ airflow_user }} bash -c 'export AIRFLOW_HOME={{ airflow_home }} && ./airflow-env/bin/airflow db init'
+
+    # Step 28: Configure Airflow
+    - name: Update Airflow configuration - SQL connection
+      lineinfile:
+        path: "{{ airflow_home }}/airflow.cfg"
+        regexp: '^sql_alchemy_conn\s*='
+        line: "sql_alchemy_conn = postgresql+psycopg2://{{ postgres_user }}:{{ airflow_password }}@localhost/{{ postgres_db }}"
+        backup: yes
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    - name: Update Airflow configuration - disable examples
+      lineinfile:
+        path: "{{ airflow_home }}/airflow.cfg"
+        regexp: '^load_examples\s*='
+        line: "load_examples = False"
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    - name: Update Airflow configuration - expose config
+      lineinfile:
+        path: "{{ airflow_home }}/airflow.cfg"
+        regexp: '^expose_config\s*='
+        line: "expose_config = True"
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    - name: Configure webserver to bind to all interfaces
+      lineinfile:
+        path: "{{ airflow_home }}/airflow.cfg"
+        regexp: '^web_server_host\s*='
+        line: "web_server_host = 0.0.0.0"
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    - name: Set webserver port
+      lineinfile:
+        path: "{{ airflow_home }}/airflow.cfg"
+        regexp: '^web_server_port\s*='
+        line: "web_server_port = 8080"
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    - name: Disable authentication for easier access (development only)
+      lineinfile:
+        path: "{{ airflow_home }}/airflow.cfg"
+        regexp: '^auth_backend\s*='
+        line: "auth_backend = airflow.api.auth.backend.default"
+        owner: "{{ airflow_user }}"
+        group: "{{ airflow_user }}"
+
+    # Step 29: Run database migration again
+    - name: Run Airflow database migration
+      shell: |
+        cd /home/{{ airflow_user }}
+        sudo -u {{ airflow_user }} bash -c 'export AIRFLOW_HOME={{ airflow_home }} && ./airflow-env/bin/airflow db upgrade'
+
+    - name: Create Airflow admin user
+      shell: |
+        cd /home/{{ airflow_user }}
+        sudo -u {{ airflow_user }} bash -c 'export AIRFLOW_HOME={{ airflow_home }} && ./airflow-env/bin/airflow users create --username {{ airflow_admin_user }} --firstname Admin --lastname User --role Admin --email admin@example.com --password {{ airflow_admin_password }}'
+      register: create_user_result
+      failed_when: 
+        - create_user_result.rc != 0
+        - '"already exists" not in create_user_result.stderr'
+
+    # Create systemd service for Airflow
+    - name: Create Airflow webserver systemd service
+      copy:
+        dest: /etc/systemd/system/airflow-webserver.service
+        content: |
+          [Unit]
+          Description=Airflow webserver daemon
+          After=network.target postgresql.service
+          Wants=postgresql.service
+
+          [Service]
+          Environment=AIRFLOW_HOME={{ airflow_home }}
+          User={{ airflow_user }}
+          Group={{ airflow_user }}
+          Type=simple
+          ExecStart=/home/{{ airflow_user }}/airflow-env/bin/airflow webserver --port 8080 --hostname 0.0.0.0
+          Restart=on-failure
+          RestartSec=5s
+          PrivateTmp=true
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Create Airflow scheduler systemd service
+      copy:
+        dest: /etc/systemd/system/airflow-scheduler.service
+        content: |
+          [Unit]
+          Description=Airflow scheduler daemon
+          After=network.target postgresql.service airflow-webserver.service
+          Wants=postgresql.service
+
+          [Service]
+          Environment=AIRFLOW_HOME={{ airflow_home }}
+          User={{ airflow_user }}
+          Group={{ airflow_user }}
+          Type=simple
+          ExecStart=/home/{{ airflow_user }}/airflow-env/bin/airflow scheduler
+          Restart=on-failure
+          RestartSec=5s
+          PrivateTmp=true
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Airflow webserver
+      systemd:
+        name: airflow-webserver
+        enabled: yes
+        state: started
+
+    - name: Enable and start Airflow scheduler
+      systemd:
+        name: airflow-scheduler
+        enabled: yes
+        state: started
+
+    - name: Wait for Airflow webserver to start
+      wait_for:
+        port: 8080
+        host: 0.0.0.0
+        delay: 10
+        timeout: 60
+
+    - name: Open firewall port 8080 (if ufw is active)
+      ufw:
+        rule: allow
+        port: '8080'
+        proto: tcp
+      ignore_errors: yes
+
+    - name: Display completion message
+      debug:
+        msg: |
+          🎉 Airflow installation completed successfully!
+          
+          ✅ Airflow is running and accessible at:
+             - Local: http://localhost:8080
+             - External: http://{{ ansible_default_ipv4.address }}:8080
+          
+          🔐 Login credentials:
+             - Username: {{ airflow_admin_user }}
+             - Password: {{ airflow_admin_password }}
+          
+          📊 Services status:
+             - Webserver: Active and running on port 8080
+             - Scheduler: Active and running
+             - Database: PostgreSQL with user {{ postgres_user }}
+          
+          🔧 Management commands:
+             sudo systemctl status airflow-webserver
+             sudo systemctl status airflow-scheduler
+             sudo systemctl restart airflow-webserver
+             sudo systemctl restart airflow-scheduler
+          
+          ⚠️  Security reminder: Change default passwords in production!
