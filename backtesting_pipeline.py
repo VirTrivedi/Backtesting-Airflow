@@ -84,27 +84,30 @@ def parse_pcap_filename(filename):
 
 @task(dag=dag)
 def download_pcap_from_s3():
-    """Find and download the most recent PCAP file from S3 to local processing directory"""
+    """Find and download the most recent PCAP file from S3 root directory"""
     try:
         s3 = boto3.client('s3')
         bucket_name = 'vir-airflow'
 
-        # List all objects in the bucket
-        response = s3.list_objects_v2(
+        # Use paginator to get all files in root directory
+        paginator = s3.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(
             Bucket=bucket_name,
             Delimiter='/'
         )
         
-        if 'Contents' not in response:
-            raise Exception(f"No files found in bucket: {bucket_name}")
+        # Collect all files from all pages
+        all_files = []
+        for page in page_iterator:
+            if 'Contents' in page:
+                all_files.extend(page['Contents'])
         
-        print(f"=== ALL FILES IN BUCKET ===")
-        all_files = response['Contents']
-        print(f"Total files in bucket: {len(all_files)}")
-
+        if not all_files:
+            raise Exception(f"No files found in bucket root directory: {bucket_name}")
+        
         # Filter for PCAP files and find the most recent
         pcap_files = []
-        for obj in response['Contents']:
+        for obj in all_files:
             key = obj['Key']
             if key.endswith('.pcap.zst') or key.endswith('.pcap'):
                 pcap_files.append({
@@ -114,7 +117,7 @@ def download_pcap_from_s3():
                 })
         
         if not pcap_files:
-            raise Exception("No PCAP files (.pcap or .pcap.zst) found in the bucket")
+            raise Exception("No PCAP files (.pcap or .pcap.zst) found in the bucket root")
         
         # Sort by last modified date and get the most recent file
         pcap_files.sort(key=lambda x: x['last_modified'], reverse=True)
@@ -142,7 +145,7 @@ def download_pcap_from_s3():
         
     except Exception as e:
         raise Exception(f"Download failed: {e}")
-    
+        
 @task(dag=dag)
 def process_pcap_file(**context):
     """Run PcapToRef on the downloaded PCAP file with parsed parameters"""
