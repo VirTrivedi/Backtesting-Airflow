@@ -84,22 +84,55 @@ def parse_pcap_filename(filename):
 
 @task(dag=dag)
 def download_pcap_from_s3():
-    """Download PCAP file from S3 to local processing directory"""
+    """Find and download the most recent PCAP file from S3 to local processing directory"""
     try:
         s3 = boto3.client('s3')
-        
-        # Configuration
         bucket_name = 'vir-airflow'
-        s3_input_path = 'BATS.BZX.A-20220801.NY4.pcap.zst'
-        local_path = '/tmp/' + s3_input_path
-            
-        # Download file
-        s3.download_file(bucket_name, s3_input_path, local_path)
-                        
-        # Parse filename to extract parameters
-        filename = Path(s3_input_path).name
-        parsed_params = parse_pcap_filename(filename)
+
+        # List all objects in the bucket
+        response = s3.list_objects_v2(
+            Bucket=bucket_name,
+            Delimiter='/'
+        )
         
+        if 'Contents' not in response:
+            raise Exception(f"No files found in bucket: {bucket_name}")
+        
+        print(f"=== ALL FILES IN BUCKET ===")
+        all_files = response['Contents']
+        print(f"Total files in bucket: {len(all_files)}")
+
+        # Filter for PCAP files and find the most recent
+        pcap_files = []
+        for obj in response['Contents']:
+            key = obj['Key']
+            if key.endswith('.pcap.zst') or key.endswith('.pcap'):
+                pcap_files.append({
+                    'key': key,
+                    'last_modified': obj['LastModified'],
+                    'size': obj['Size']
+                })
+        
+        if not pcap_files:
+            raise Exception("No PCAP files (.pcap or .pcap.zst) found in the bucket")
+        
+        # Sort by last modified date and get the most recent file
+        pcap_files.sort(key=lambda x: x['last_modified'], reverse=True)
+        most_recent_file = pcap_files[0]
+        s3_input_path = most_recent_file['key']
+        
+        # Download the selected file
+        local_path = '/tmp/' + os.path.basename(s3_input_path)
+        s3.download_file(bucket_name, s3_input_path, local_path)
+        
+        # Verify download
+        if not os.path.exists(local_path):
+            raise Exception(f"Download failed - file not found at: {local_path}")
+                                
+        # Parse filename to extract parameters
+        filename = os.path.basename(s3_input_path)
+        parsed_params = parse_pcap_filename(filename)
+
         # Store file info in XCom
         return {
             'input_file': local_path,
@@ -109,7 +142,7 @@ def download_pcap_from_s3():
         
     except Exception as e:
         raise Exception(f"Download failed: {e}")
-
+    
 @task(dag=dag)
 def process_pcap_file(**context):
     """Run PcapToRef on the downloaded PCAP file with parsed parameters"""
