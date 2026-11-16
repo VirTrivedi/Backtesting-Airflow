@@ -45,8 +45,9 @@ On any task failure `cleanup_on_failure` removes the downloaded PCAP and the `/t
 
 ## Setup
 
-1. **Provision the instance.** Set `airflow_password` and `airflow_admin_password` in `airflow-setup.yml`, then:
+1. **Provision the instance.** The playbook reads both passwords from the environment, so nothing secret is committed:
    ```bash
+   export AIRFLOW_PASSWORD='...' AIRFLOW_ADMIN_PASSWORD='...'
    ansible-playbook -i inventory airflow-setup.yml
    ```
 2. **Install the binaries and DAG.** Put `PcapToRef` and `HistBook` in `/home/airflow/`, and copy `backtesting_pipeline.py` into `$AIRFLOW_HOME/dags/` (the playbook leaves the DAGs folder at its default). The DAG imports `boto3` and shells out to `aws s3 sync`, so `boto3` must be installed in the Airflow virtualenv and the AWS CLI on the host, with credentials (for example an instance role) that can read and write the bucket. The playbook does not install either.
