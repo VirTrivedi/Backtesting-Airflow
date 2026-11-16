@@ -5,13 +5,13 @@
   vars:
     airflow_user: airflow
     airflow_home: /home/airflow/airflow
-    airflow_password: your_secure_password123  # Change this to a secure password
+    airflow_password: "{{ lookup('env', 'AIRFLOW_PASSWORD') }}"  # export AIRFLOW_PASSWORD before running
     postgres_db: airflow_db
     postgres_user: airflow_user
     python_version: "3.12"
     airflow_version: "2.10.3"
     airflow_admin_user: admin
-    airflow_admin_password: admin123
+    airflow_admin_password: "{{ lookup('env', 'AIRFLOW_ADMIN_PASSWORD') }}"  # export AIRFLOW_ADMIN_PASSWORD before running
 
   tasks:
     # Steps 1-2: Update system and install packages
